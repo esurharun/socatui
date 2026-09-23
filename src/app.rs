@@ -484,24 +484,24 @@ impl App {
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if self.selected < self.tunnels.len() {
-                    let mut t = self.tunnels.remove(self.selected);
-                    if t.is_running() {
-                        t.stop();
-                        if !t.wait_exit(Duration::from_secs(2)) {
-                            t.kill_now();
-                            t.wait_exit(Duration::from_secs(1));
-                        }
-                    }
-                    self.set_status(format!("deleted {}", t.config.name));
-                    self.clamp_selection();
-                    self.persist();
-                }
-            }
-            _ => {}
+        let confirmed = matches!(
+            key.code,
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+        );
+        if !confirmed || self.selected >= self.tunnels.len() {
+            return;
         }
+        let mut t = self.tunnels.remove(self.selected);
+        if t.is_running() {
+            t.stop();
+            if !t.wait_exit(Duration::from_secs(2)) {
+                t.kill_now();
+                t.wait_exit(Duration::from_secs(1));
+            }
+        }
+        self.set_status(format!("deleted {}", t.config.name));
+        self.clamp_selection();
+        self.persist();
     }
 
     /// Stop every running socat before the terminal is handed back.
