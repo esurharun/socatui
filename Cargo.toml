@@ -1,6 +1,6 @@
 [package]
 name = "socatui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A task-manager style TUI for running and monitoring multiple socat relays"
 license = "MIT"

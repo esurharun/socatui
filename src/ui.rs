@@ -1,6 +1,6 @@
 //! Rendering.
 
-use crate::app::{App, ExportDialog, Form, Mode, FORM_FIELDS};
+use crate::app::{App, ExportDialog, Form, Mode, FORM_FIELDS, FORM_FIRST_TOGGLE};
 use crate::tunnel::{Status, Tunnel};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -51,7 +51,7 @@ pub fn human_duration(d: Duration) -> String {
 fn status_style(s: &Status) -> Style {
     match s {
         Status::Running => Style::default().fg(Color::Green).bold(),
-        Status::Stopping => Style::default().fg(Color::Yellow),
+        Status::Stopping | Status::Restarting => Style::default().fg(Color::Yellow),
         Status::Stopped => Style::default().fg(Color::DarkGray),
         Status::Exited(Some(0)) => Style::default().fg(Color::DarkGray),
         Status::Exited(_) => Style::default().fg(Color::Red),
@@ -62,11 +62,12 @@ fn status_style(s: &Status) -> Style {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let log_height = if app.show_log { 9 } else { 0 };
+    let footer_h = footer_height(app, area.width);
     let [header, table_area, log_area, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(log_height),
-        Constraint::Length(1),
+        Constraint::Length(footer_h),
     ])
     .areas(area);
 
@@ -90,7 +91,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let (ltr, rtl) = app.total_rates();
     let line = Line::from(vec![
         Span::styled(
-            " socatui ",
+            concat!(" socatui v", env!("CARGO_PKG_VERSION"), " "),
             Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
         ),
         Span::raw(format!(
@@ -138,7 +139,8 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let widths = [
         Constraint::Length(3),
         Constraint::Min(8),
-        Constraint::Length(9),
+        Constraint::Length(5),
+        Constraint::Length(10),
         Constraint::Length(7),
         Constraint::Fill(2),
         Constraint::Fill(2),
@@ -218,7 +220,17 @@ fn row_for(i: usize, t: &Tunnel) -> Row<'static> {
         } else {
             dim
         }),
-        Cell::from(t.status.label()).style(status_style(&t.status)),
+        Cell::from(format!(
+            "{}{}",
+            if t.config.autostart { "A" } else { "·" },
+            if t.config.auto_restart { "R" } else { "·" }
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
+        Cell::from(match t.restart_in() {
+            Some(d) => format!("retry {}s", d.as_secs() + 1),
+            None => t.status.label(),
+        })
+        .style(status_style(&t.status)),
         Cell::from(pid).style(dim),
         Cell::from(t.config.source.clone()).style(dim),
         Cell::from(t.config.destination.clone()).style(dim),
@@ -266,50 +278,94 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = match &app.mode {
-        Mode::Form(_) => Line::from(vec![
-            key("Tab/↑↓", "field"),
-            key("Space", "toggle"),
-            key("Enter", "save"),
-            key("Esc", "cancel"),
-        ]),
-        Mode::ConfirmDelete => Line::from(vec![key("y", "confirm delete"), key("any", "cancel")]),
-        Mode::Export(_) => Line::from(vec![
-            key("Tab", "selected/all"),
-            key("Ctrl-U", "clear path"),
-            key("Enter", "write"),
-            key("Esc", "cancel"),
-        ]),
-        Mode::Help => Line::from(vec![key("any key", "close")]),
+/// Key/description pairs shown in the bottom bar for the current mode, or
+/// `None` when a transient status message replaces the bar.
+fn footer_items(app: &App) -> Option<Vec<(&'static str, &'static str)>> {
+    Some(match &app.mode {
+        Mode::Form(_) => vec![
+            ("Tab/↑↓", "field"),
+            ("Space", "toggle"),
+            ("Enter", "save"),
+            ("Esc", "cancel"),
+        ],
+        Mode::ConfirmDelete => vec![("y", "confirm delete"), ("any", "cancel")],
+        Mode::Export(_) => vec![
+            ("Tab", "selected/all"),
+            ("Ctrl-U", "clear path"),
+            ("Enter", "write"),
+            ("Esc", "cancel"),
+        ],
+        Mode::Help => vec![("any key", "close")],
         Mode::Normal => {
-            if let Some(msg) = app.status_text() {
-                Line::from(Span::styled(
-                    format!(" {msg}"),
-                    Style::default().fg(Color::Yellow),
-                ))
-            } else {
-                Line::from(vec![
-                    key("a", "add"),
-                    key("e", "edit"),
-                    key("d", "del"),
-                    key("s", "start/stop"),
-                    key("r", "restart"),
-                    key("c", "clear stats"),
-                    key("l", "log"),
-                    key("w/W", "export log"),
-                    key("S/X", "start/stop all"),
-                    key("?", "help"),
-                    key("q", "quit"),
-                ])
+            if app.status_text().is_some() {
+                return None;
             }
+            vec![
+                ("a", "add"),
+                ("e", "edit"),
+                ("d", "del"),
+                ("s", "start/stop"),
+                ("r", "restart"),
+                ("t", "auto-restart"),
+                ("c", "clear stats"),
+                ("l", "log"),
+                ("w/W", "export"),
+                ("S/X", "all"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
         }
-    };
-    f.render_widget(Paragraph::new(line), area);
+    })
 }
 
-fn key(k: &str, desc: &str) -> Span<'static> {
-    Span::raw(format!(" [{k}] {desc} "))
+/// Lay the footer out for `width` columns; returns the lines to draw.
+fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    match footer_items(app) {
+        None => vec![Line::from(Span::styled(
+            format!(" {}", app.status_text().unwrap_or_default()),
+            Style::default().fg(Color::Yellow),
+        ))],
+        Some(items) => keybar(&items, width as usize),
+    }
+}
+
+/// Number of rows the footer needs at this width.
+fn footer_height(app: &App, width: u16) -> u16 {
+    footer_lines(app, width).len().max(1) as u16
+}
+
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let lines = footer_lines(app, area.width);
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render `(key, description)` pairs as highlighted key badges, wrapping onto
+/// additional lines whenever the next badge would not fit in `width`.
+fn keybar(items: &[(&str, &str)], width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (k, desc) in items {
+        let badge = format!(" {k} ");
+        let text = format!(" {desc}");
+        let w = 1 + badge.chars().count() + text.chars().count();
+        if used > 0 && used + w > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            badge,
+            Style::default().fg(Color::Black).bg(Color::Cyan).bold(),
+        ));
+        spans.push(Span::styled(text, Style::default().fg(Color::Gray)));
+        used += w;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -324,7 +380,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
-    let popup = centered(area, 78, 15);
+    let popup = centered(area, 78, 17);
     f.render_widget(Clear, popup);
     let title = if form.editing.is_some() {
         " edit tunnel "
@@ -338,15 +394,24 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    let labels = ["Name", "Source", "Destination", "Options", "Autostart"];
+    let labels = [
+        "Name",
+        "Source",
+        "Destination",
+        "Options",
+        "Autostart",
+        "Auto-restart",
+    ];
     let hints = [
         "a label for the list",
         "left address, e.g. TCP-LISTEN:8080,fork,reuseaddr",
         "right address, e.g. TCP:example.com:80",
         "extra socat flags, e.g. -d -d -T 30",
         "start this tunnel when socatui launches",
+        "restart socat if it exits without being stopped (1s..30s backoff)",
     ];
     let rows = Layout::vertical([
+        Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
@@ -364,16 +429,21 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
             Style::default().fg(Color::Gray)
         };
         let [label_area, value_area] =
-            Layout::horizontal([Constraint::Length(13), Constraint::Min(1)]).areas(rows[i]);
+            Layout::horizontal([Constraint::Length(15), Constraint::Min(1)]).areas(rows[i]);
         f.render_widget(
             Paragraph::new(vec![Line::from(Span::styled(
-                format!("{:>11}: ", labels[i]),
+                format!("{:>13}: ", labels[i]),
                 label_style,
             ))]),
             label_area,
         );
-        if i == FORM_FIELDS - 1 {
-            let v = if form.autostart { "[x] yes" } else { "[ ] no" };
+        if i >= FORM_FIRST_TOGGLE {
+            let on = if i == FORM_FIRST_TOGGLE {
+                form.autostart
+            } else {
+                form.auto_restart
+            };
+            let v = if on { "[x] yes" } else { "[ ] no" };
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(v),
@@ -422,7 +492,10 @@ fn draw_form(f: &mut Frame, form: &Form, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
     };
-    f.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), rows[5]);
+    f.render_widget(
+        Paragraph::new(footer).wrap(Wrap { trim: true }),
+        rows[FORM_FIELDS],
+    );
 }
 
 fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
@@ -532,7 +605,7 @@ fn draw_export(f: &mut Frame, app: &App, dialog: &ExportDialog, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let popup = centered(area, 72, 23);
+    let popup = centered(area, 72, 25);
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -549,6 +622,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "start / stop selected (press again while stopping = SIGKILL)",
         ),
         ("r", "restart selected"),
+        ("t", "toggle auto-restart for selected"),
         ("K", "SIGKILL selected"),
         ("S / X", "start all / stop all"),
         ("c / C", "clear stats: selected / all"),
@@ -580,6 +654,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
     )));
     lines.push(Line::from(Span::styled(
         "  each connection is a socat child and CONN shows how many are alive.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  FLAGS: A = autostart, R = auto-restart on unexpected exit.",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(Paragraph::new(lines).block(block), popup);

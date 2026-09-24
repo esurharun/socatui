@@ -70,7 +70,9 @@ impl Input {
     }
 }
 
-pub const FORM_FIELDS: usize = 5;
+pub const FORM_FIELDS: usize = 6;
+/// Index of the first checkbox field in the form (Autostart, Auto-restart).
+pub const FORM_FIRST_TOGGLE: usize = 4;
 
 pub struct Form {
     pub editing: Option<u64>,
@@ -79,6 +81,7 @@ pub struct Form {
     pub destination: Input,
     pub options: Input,
     pub autostart: bool,
+    pub auto_restart: bool,
     pub focus: usize,
     pub error: Option<String>,
 }
@@ -92,6 +95,7 @@ impl Form {
             destination: Input::default(),
             options: Input::default(),
             autostart: false,
+            auto_restart: false,
             focus: 0,
             error: None,
         }
@@ -104,6 +108,7 @@ impl Form {
             destination: Input::with(&c.destination),
             options: Input::with(&c.options),
             autostart: c.autostart,
+            auto_restart: c.auto_restart,
             focus: 0,
             error: None,
         }
@@ -139,6 +144,7 @@ impl Form {
             destination: destination.to_string(),
             options: self.options.text.trim().to_string(),
             autostart: self.autostart,
+            auto_restart: self.auto_restart,
         })
     }
 }
@@ -299,6 +305,9 @@ impl App {
         };
         for t in &mut self.tunnels {
             t.tick(&snapshot);
+            if t.restart_due() {
+                t.start(self.tx.clone());
+            }
         }
     }
 
@@ -369,7 +378,7 @@ impl App {
             }
             KeyCode::Char('S') => {
                 let tx = self.tx.clone();
-                for t in self.tunnels.iter_mut().filter(|t| !t.is_running()) {
+                for t in self.tunnels.iter_mut().filter(|t| !t.is_active()) {
                     t.start(tx.clone());
                 }
                 self.set_status("started all tunnels".into());
@@ -391,6 +400,19 @@ impl App {
                 }
             }
             KeyCode::Char('l') => self.show_log = !self.show_log,
+            KeyCode::Char('t') => {
+                if let Some(t) = self.tunnels.get_mut(self.selected) {
+                    t.config.auto_restart = !t.config.auto_restart;
+                    let msg = if t.config.auto_restart {
+                        format!("auto-restart enabled for {}", t.config.name)
+                    } else {
+                        t.cancel_restart();
+                        format!("auto-restart disabled for {}", t.config.name)
+                    };
+                    self.set_status(msg);
+                    self.persist();
+                }
+            }
             KeyCode::Char('w') => self.open_export(false),
             KeyCode::Char('W') => self.open_export(true),
             KeyCode::Char('J') => self.move_selected(1),
@@ -408,6 +430,8 @@ impl App {
                 } else {
                     t.stop();
                 }
+            } else if t.is_active() {
+                t.cancel_restart();
             } else {
                 t.start(tx);
             }
@@ -423,6 +447,8 @@ impl App {
                     t.kill_now();
                     t.wait_exit(Duration::from_secs(1));
                 }
+            } else {
+                t.cancel_restart();
             }
             t.start(tx);
         }
@@ -455,7 +481,12 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => {
                 form.focus = (form.focus + FORM_FIELDS - 1) % FORM_FIELDS
             }
-            KeyCode::Char(' ') if form.focus == FORM_FIELDS - 1 => form.autostart = !form.autostart,
+            KeyCode::Char(' ') if form.focus == FORM_FIRST_TOGGLE => {
+                form.autostart = !form.autostart
+            }
+            KeyCode::Char(' ') if form.focus == FORM_FIRST_TOGGLE + 1 => {
+                form.auto_restart = !form.auto_restart
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(i) = form.input_mut() {
                     i.clear();

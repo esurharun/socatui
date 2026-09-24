@@ -6,14 +6,7 @@ monitoring multiple `socat` relays. Each tunnel is one
 status, PID, active connections, bytes transferred in each direction, live
 throughput and uptime, refreshed once per second.
 
-```
- socatui   2 tunnels, 1 running   → 418 KiB/s   ← 418 KiB/s
-┌ tunnels ────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  #   NAME         STATUS    PID     SOURCE                     DESTINATION          CONN → BYTES  ← BYTES  → RATE      ← RATE      UPTIME │
-│▶ 1   echo-relay   running   78913   TCP-LISTEN:19877,fork,...  TCP:127.0.0.1:19878  2    830 KiB  830 KiB  418 KiB/s   418 KiB/s   3s     │
-│  2   web-proxy    stopped   -       TCP-LISTEN:18080,fork,...  TCP:example.com:80   -    0 B      0 B      0 B/s       0 B/s       -      │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+![SocatUI](etc/screen-shoot.png)
 
 ## Requirements
 
@@ -40,6 +33,7 @@ SOCATUI_CONFIG=/path/tunnels.json ./target/release/socatui
 | `d`            | delete selected (asks for confirmation)                  |
 | `s` / `Space`  | start or stop selected (press again while stopping to SIGKILL) |
 | `r`            | restart selected                                         |
+| `t`            | toggle auto-restart for selected                         |
 | `K`            | SIGKILL selected                                         |
 | `S` / `X`      | start all / stop all                                     |
 | `c` / `C`      | clear statistics for selected / all                      |
@@ -60,7 +54,8 @@ In the add/edit form: `Tab`/`↑`/`↓` move between fields, `Space` toggles
 | Source      | left socat address, e.g. `TCP-LISTEN:8080,fork,reuseaddr`         |
 | Destination | right socat address, e.g. `TCP:example.com:80`, `UNIX-CONNECT:/tmp/x.sock`, `EXEC:/bin/cat` |
 | Options     | extra socat command-line options, split like a shell would, e.g. `-d -d -T 30` |
-| Autostart   | start when socatui launches                                       |
+| Autostart   | start when socatui launches (`A` in the FLAGS column)             |
+| Auto-restart | restart socat whenever it exits without being stopped by you (`R` in FLAGS). Backoff starts at 1s and doubles up to 30s; a run of 30s or more resets it. Stopping the tunnel (or quitting) cancels a pending restart. |
 
 Source and destination are passed to socat verbatim as single arguments, so
 no shell quoting is needed (or applied). Definitions are stored as JSON in the

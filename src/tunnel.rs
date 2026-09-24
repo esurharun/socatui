@@ -29,6 +29,10 @@ const LOG_CAPACITY: usize = 500;
 const DEAD_PID_GRACE: Duration = Duration::from_secs(3);
 /// After SIGTERM, escalate to SIGKILL if the process is still around.
 const KILL_AFTER: Duration = Duration::from_secs(3);
+/// Auto-restart backoff: 1s, 2s, 4s ... capped here.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A run at least this long resets the backoff.
+const RESTART_STABLE_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq)]
 pub struct TunnelConfig {
@@ -42,6 +46,9 @@ pub struct TunnelConfig {
     pub options: String,
     #[serde(default)]
     pub autostart: bool,
+    /// Restart automatically when socat exits without being asked to stop.
+    #[serde(default)]
+    pub auto_restart: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -66,6 +73,8 @@ pub enum Status {
     Stopped,
     Running,
     Stopping,
+    /// Exited unexpectedly; auto-restart pending.
+    Restarting,
     Exited(Option<i32>),
     Failed(String),
 }
@@ -76,6 +85,7 @@ impl Status {
             Status::Stopped => "stopped".into(),
             Status::Running => "running".into(),
             Status::Stopping => "stopping".into(),
+            Status::Restarting => "restarting".into(),
             Status::Exited(Some(0)) => "exited".into(),
             Status::Exited(Some(c)) => format!("exit {c}"),
             Status::Exited(None) => "killed".into(),
@@ -156,6 +166,9 @@ pub struct Tunnel {
     pub pid: Option<u32>,
     pub started: Option<Instant>,
     stop_requested: Option<Instant>,
+    /// When a pending auto-restart should fire.
+    restart_at: Option<Instant>,
+    restart_attempts: u32,
     per_pid: HashMap<u32, PidEntry>,
     archived: Counters,
     pub total: Counters,
@@ -181,6 +194,8 @@ impl Tunnel {
             pid: None,
             started: None,
             stop_requested: None,
+            restart_at: None,
+            restart_attempts: 0,
             per_pid: HashMap::new(),
             archived: Counters::default(),
             total: Counters::default(),
@@ -196,6 +211,31 @@ impl Tunnel {
 
     pub fn is_running(&self) -> bool {
         self.child.is_some()
+    }
+
+    /// Running, or waiting for an auto-restart.
+    pub fn is_active(&self) -> bool {
+        self.child.is_some() || self.restart_at.is_some()
+    }
+
+    /// Time until a pending auto-restart fires.
+    pub fn restart_in(&self) -> Option<Duration> {
+        self.restart_at
+            .map(|t| t.saturating_duration_since(Instant::now()))
+    }
+
+    /// True once a pending auto-restart is due; the caller then calls `start`.
+    pub fn restart_due(&self) -> bool {
+        self.restart_at.is_some_and(|t| Instant::now() >= t)
+    }
+
+    /// Cancel a pending auto-restart (manual stop).
+    pub fn cancel_restart(&mut self) {
+        if self.restart_at.take().is_some() {
+            self.restart_attempts = 0;
+            self.status = Status::Stopped;
+            self.push_log("auto-restart cancelled".into());
+        }
     }
 
     pub fn uptime(&self) -> Option<Duration> {
@@ -291,12 +331,14 @@ impl Tunnel {
                 self.child = Some(child);
                 self.started = Some(Instant::now());
                 self.stop_requested = None;
+                self.restart_at = None;
                 self.status = Status::Running;
                 self.connections = 0;
                 let cl = self.command_line();
                 self.push_log(format!("started pid {pid}: {cl}"));
             }
             Err(e) => {
+                self.restart_at = None;
                 self.status = Status::Failed(format!("spawn failed: {e}"));
                 self.push_log(format!("failed to start socat: {e}"));
             }
@@ -305,6 +347,7 @@ impl Tunnel {
 
     /// Ask the whole process group to terminate; `tick` escalates to SIGKILL.
     pub fn stop(&mut self) {
+        self.cancel_restart();
         if let (Some(pid), true) = (self.pid, self.child.is_some()) {
             let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
             self.stop_requested = Some(Instant::now());
@@ -314,6 +357,7 @@ impl Tunnel {
     }
 
     pub fn kill_now(&mut self) {
+        self.cancel_restart();
         if let (Some(pid), true) = (self.pid, self.child.is_some()) {
             let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
             self.stop_requested = Some(Instant::now());
@@ -402,16 +446,32 @@ impl Tunnel {
             match child.try_wait() {
                 Ok(Some(st)) => {
                     let code = st.code();
-                    self.status = if self.stop_requested.is_some() {
-                        Status::Stopped
-                    } else {
-                        Status::Exited(code)
-                    };
+                    let requested = self.stop_requested.is_some();
+                    let ran_for = self.started.map(|s| s.elapsed()).unwrap_or_default();
                     self.push_log(format!("socat {st}"));
                     self.child = None;
                     self.pid = None;
                     self.stop_requested = None;
                     self.connections = 0;
+                    if requested {
+                        self.status = Status::Stopped;
+                    } else if self.config.auto_restart {
+                        if ran_for >= RESTART_STABLE_AFTER {
+                            self.restart_attempts = 0;
+                        }
+                        let delay = Duration::from_secs(1u64 << self.restart_attempts.min(5))
+                            .min(RESTART_BACKOFF_MAX);
+                        self.restart_attempts = self.restart_attempts.saturating_add(1);
+                        self.restart_at = Some(now + delay);
+                        self.status = Status::Restarting;
+                        self.push_log(format!(
+                            "exited unexpectedly; auto-restart in {}s (attempt {})",
+                            delay.as_secs(),
+                            self.restart_attempts
+                        ));
+                    } else {
+                        self.status = Status::Exited(code);
+                    }
                 }
                 Ok(None) => {
                     if let Some(t) = self.stop_requested {
