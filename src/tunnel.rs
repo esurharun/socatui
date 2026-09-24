@@ -16,7 +16,7 @@ use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::Sender;
@@ -214,6 +214,30 @@ impl Tunnel {
         parts.push(self.config.source.clone());
         parts.push(self.config.destination.clone());
         parts.join(" ")
+    }
+
+    /// Write this tunnel's retained log (with a header and stats summary) to `w`.
+    /// Returns the number of log lines written.
+    pub fn write_log(&self, w: &mut impl Write) -> io::Result<usize> {
+        writeln!(w, "=== {} [{}] ===", self.config.name, self.status.label())?;
+        writeln!(w, "command: {}", self.command_line())?;
+        if let Some(pid) = self.pid {
+            writeln!(w, "pid: {pid}")?;
+        }
+        writeln!(
+            w,
+            "stats: left->right {} packets / {} bytes, right->left {} packets / {} bytes, {} sessions",
+            self.total.ltr_packets,
+            self.total.ltr_bytes,
+            self.total.rtl_packets,
+            self.total.rtl_bytes,
+            self.sessions
+        )?;
+        writeln!(w)?;
+        for line in &self.log {
+            writeln!(w, "{line}")?;
+        }
+        Ok(self.log.len())
     }
 
     pub fn push_log(&mut self, line: String) {

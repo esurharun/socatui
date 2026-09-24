@@ -1,6 +1,6 @@
 //! Rendering.
 
-use crate::app::{App, Form, Mode, FORM_FIELDS};
+use crate::app::{App, ExportDialog, Form, Mode, FORM_FIELDS};
 use crate::tunnel::{Status, Tunnel};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -81,6 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Normal => {}
         Mode::Form(form) => draw_form(f, form, area),
         Mode::ConfirmDelete => draw_confirm(f, app, area),
+        Mode::Export(dialog) => draw_export(f, app, dialog, area),
         Mode::Help => draw_help(f, area),
     }
 }
@@ -274,6 +275,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             key("Esc", "cancel"),
         ]),
         Mode::ConfirmDelete => Line::from(vec![key("y", "confirm delete"), key("any", "cancel")]),
+        Mode::Export(_) => Line::from(vec![
+            key("Tab", "selected/all"),
+            key("Ctrl-U", "clear path"),
+            key("Enter", "write"),
+            key("Esc", "cancel"),
+        ]),
         Mode::Help => Line::from(vec![key("any key", "close")]),
         Mode::Normal => {
             if let Some(msg) = app.status_text() {
@@ -290,6 +297,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     key("r", "restart"),
                     key("c", "clear stats"),
                     key("l", "log"),
+                    key("w/W", "export log"),
                     key("S/X", "start/stop all"),
                     key("?", "help"),
                     key("q", "quit"),
@@ -450,8 +458,81 @@ fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn draw_export(f: &mut Frame, app: &App, dialog: &ExportDialog, area: Rect) {
+    let popup = centered(area, 78, 9);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" export log ");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let scope = if dialog.all {
+        format!("all {} tunnels", app.tunnels.len())
+    } else {
+        app.selected_tunnel()
+            .map(|t| format!("\"{}\" only", t.config.name))
+            .unwrap_or_default()
+    };
+    let [scope_area, path_label, path_area, hint_area, msg_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Scope: ", Style::default().fg(Color::Gray)),
+            Span::styled(scope, Style::default().bold()),
+            Span::styled("   (Tab toggles)", Style::default().fg(Color::DarkGray)),
+        ])),
+        scope_area,
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Path:",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        path_label,
+    );
+    let w = path_area.width.max(1) as usize;
+    let chars: Vec<char> = dialog.path.text.chars().collect();
+    let start = dialog.path.cursor.saturating_sub(w.saturating_sub(1));
+    let visible: String = chars.iter().skip(start).take(w).collect();
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            visible,
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        )),
+        path_area,
+    );
+    let cx = path_area.x + (dialog.path.cursor - start) as u16;
+    f.set_cursor_position((cx.min(path_area.right().saturating_sub(1)), path_area.y));
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Leave empty for a random file under /tmp. Existing files are overwritten.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        hint_area,
+    );
+    if let Some(e) = &dialog.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("✗ {e}"),
+                Style::default().fg(Color::Red),
+            ))
+            .wrap(Wrap { trim: true }),
+            msg_area,
+        );
+    }
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
-    let popup = centered(area, 72, 22);
+    let popup = centered(area, 72, 23);
     f.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -473,6 +554,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("c / C", "clear stats: selected / all"),
         ("J / U", "move selected down / up"),
         ("l", "toggle log pane"),
+        ("w / W", "export log of selected / all tunnels to a file"),
         ("q / Ctrl-C", "quit (stops all tunnels)"),
     ];
     let mut lines: Vec<Line> = entries

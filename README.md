@@ -45,6 +45,7 @@ SOCATUI_CONFIG=/path/tunnels.json ./target/release/socatui
 | `c` / `C`      | clear statistics for selected / all                      |
 | `J` / `U`      | move selected down / up in the list                      |
 | `l`            | toggle the log pane                                      |
+| `w` / `W`      | export the log of the selected tunnel / of all tunnels to a file |
 | `?`            | help                                                     |
 | `q` / `Ctrl-C` | quit, stopping every tunnel                              |
 
@@ -85,4 +86,15 @@ period so that PID reuse cannot lose bytes. `CONN` is the number of live
 forked workers, and throughput is the delta between consecutive samples.
 
 All other stderr output from socat (errors, `-d` diagnostics, exit status) is
-shown in the log pane for the selected tunnel.
+shown in the log pane for the selected tunnel. The last 500 lines per tunnel
+are kept in memory.
+
+## Exporting logs
+
+`w` exports the selected tunnel's log, `W` exports every tunnel's log. The
+dialog is prefilled with a random path such as
+`/tmp/socatui-echo-relay-1758640000-a3f9c1.log`; press `Enter` to write it
+there, or type another path first (`Ctrl-U` clears the field, `Tab` switches
+between the selected tunnel and all tunnels). Each tunnel section starts with a
+header giving the status, the exact socat command line, the PID and the
+transfer counters, followed by the retained log lines.

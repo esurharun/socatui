@@ -5,7 +5,9 @@ use crate::procs;
 use crate::tunnel::{ProcEvent, Status, Tunnel, TunnelConfig};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -141,11 +143,58 @@ impl Form {
     }
 }
 
+/// Dialog for writing tunnel logs to a file.
+pub struct ExportDialog {
+    /// true = every tunnel, false = the selected one
+    pub all: bool,
+    pub path: Input,
+    pub error: Option<String>,
+}
+
+impl ExportDialog {
+    fn new(all: bool, suggested: String) -> Self {
+        Self {
+            all,
+            path: Input::with(&suggested),
+            error: None,
+        }
+    }
+}
+
 pub enum Mode {
     Normal,
     Form(Form),
     ConfirmDelete,
+    Export(ExportDialog),
     Help,
+}
+
+/// `/tmp/socatui-<label>-<unix time>-<random hex>.log`
+pub fn random_export_path(label: &str) -> PathBuf {
+    let slug: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut x = now.as_nanos() as u64 ^ (std::process::id() as u64).rotate_left(32);
+    // xorshift so consecutive calls in the same nanosecond still differ
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    PathBuf::from("/tmp").join(format!(
+        "socatui-{slug}-{}-{:06x}.log",
+        now.as_secs(),
+        x & 0xff_ffff
+    ))
 }
 
 pub struct App {
@@ -277,6 +326,7 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::Form(form) => self.on_key_form(form, key),
             Mode::ConfirmDelete => self.on_key_confirm(key),
+            Mode::Export(dialog) => self.on_key_export(dialog, key),
             Mode::Help => {} // any key closes help
         }
     }
@@ -341,6 +391,8 @@ impl App {
                 }
             }
             KeyCode::Char('l') => self.show_log = !self.show_log,
+            KeyCode::Char('w') => self.open_export(false),
+            KeyCode::Char('W') => self.open_export(true),
             KeyCode::Char('J') => self.move_selected(1),
             KeyCode::Char('U') => self.move_selected(-1),
             _ => {}
@@ -483,6 +535,95 @@ impl App {
         self.persist();
     }
 
+    fn open_export(&mut self, all: bool) {
+        if self.tunnels.is_empty() {
+            self.set_status("nothing to export".into());
+            return;
+        }
+        let label = if all {
+            "all".to_string()
+        } else {
+            self.tunnels[self.selected].config.name.clone()
+        };
+        let suggested = random_export_path(&label).to_string_lossy().into_owned();
+        self.mode = Mode::Export(ExportDialog::new(all, suggested));
+    }
+
+    fn on_key_export(&mut self, mut dialog: ExportDialog, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => return,
+            KeyCode::Enter => {
+                let path = if dialog.path.text.trim().is_empty() {
+                    let label = if dialog.all {
+                        "all".to_string()
+                    } else {
+                        self.tunnels[self.selected].config.name.clone()
+                    };
+                    random_export_path(&label)
+                } else {
+                    PathBuf::from(dialog.path.text.trim())
+                };
+                match self.export_logs(dialog.all, &path) {
+                    Ok(lines) => {
+                        self.set_status(format!("wrote {lines} log lines to {}", path.display()));
+                        return;
+                    }
+                    Err(e) => dialog.error = Some(format!("{}: {e}", path.display())),
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                dialog.all = !dialog.all;
+                // keep a random suggestion in sync with the new scope
+                let label = if dialog.all {
+                    "all".to_string()
+                } else {
+                    self.tunnels[self.selected].config.name.clone()
+                };
+                if dialog.path.text.starts_with("/tmp/socatui-") {
+                    dialog.path = Input::with(&random_export_path(&label).to_string_lossy());
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.path.clear()
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.path.home()
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                dialog.path.end()
+            }
+            KeyCode::Char(c) => dialog.path.insert(c),
+            KeyCode::Backspace => dialog.path.backspace(),
+            KeyCode::Delete => dialog.path.delete(),
+            KeyCode::Left => dialog.path.left(),
+            KeyCode::Right => dialog.path.right(),
+            KeyCode::Home => dialog.path.home(),
+            KeyCode::End => dialog.path.end(),
+            _ => {}
+        }
+        self.mode = Mode::Export(dialog);
+    }
+
+    /// Write the log of the selected tunnel (or of all tunnels) to `path`.
+    /// Returns the number of log lines written.
+    pub fn export_logs(&self, all: bool, path: &Path) -> std::io::Result<usize> {
+        let file = File::create(path)?;
+        let mut w = BufWriter::new(file);
+        let mut lines = 0;
+        if all {
+            for (i, t) in self.tunnels.iter().enumerate() {
+                if i > 0 {
+                    writeln!(w)?;
+                }
+                lines += t.write_log(&mut w)?;
+            }
+        } else if let Some(t) = self.tunnels.get(self.selected) {
+            lines += t.write_log(&mut w)?;
+        }
+        w.flush()?;
+        Ok(lines)
+    }
+
     fn on_key_confirm(&mut self, key: KeyEvent) {
         let confirmed = matches!(
             key.code,
@@ -515,5 +656,21 @@ impl App {
                 t.wait_exit(Duration::from_secs(1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_export_paths_are_unique_and_sanitized() {
+        let a = random_export_path("echo relay/1");
+        let b = random_export_path("echo relay/1");
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("socatui-echo_relay_1-"), "{name}");
+        assert!(name.ends_with(".log"));
+        assert_eq!(a.parent().unwrap(), Path::new("/tmp"));
     }
 }
